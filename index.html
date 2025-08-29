@@ -1,0 +1,485 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
+import { Input } from "@/components/ui/input";
+import { Mic, Square, Activity } from "lucide-react";
+import { motion } from "framer-motion";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  ResponsiveContainer,
+  Tooltip,
+  ReferenceLine,
+} from "recharts";
+
+// --- Helper math ---
+const clamp = (v: number, min: number, max: number) => Math.min(Math.max(v, min), max);
+const toDbFS = (rms: number) => {
+  const eps = 1e-12;
+  const v = Math.max(rms, eps);
+  return 20 * Math.log10(v);
+};
+
+// Exponential moving average smoother (on linear domain => convert to dB at the end)
+function ema(prev: number | null, next: number, alpha: number) {
+  if (prev === null) return next;
+  return alpha * next + (1 - alpha) * prev;
+}
+
+// Format with one decimal
+const fmt1 = (n: number) => (Number.isFinite(n) ? n.toFixed(1) : "--");
+
+// History point type
+interface Pt { t: number; dB: number }
+
+export default function DecibelMeter() {
+  const [running, setRunning] = useState(false);
+  const [displayDb, setDisplayDb] = useState<number | null>(null);
+  const [peakDb, setPeakDb] = useState<number | null>(null);
+  const [calOffset, setCalOffset] = useState<number>(0); // dB to add for SPL-like display
+  const [name, setName] = useState<string>("My Mic");
+  const [holdPeak, setHoldPeak] = useState<boolean>(true);
+  const [smoothingMs, setSmoothingMs] = useState<number>(250);
+  const [history, setHistory] = useState<Pt[]>([]);
+  const [err, setErr] = useState<string>("");
+
+  // diagnostic permission state (for debugging / test)
+  const [permState, setPermState] = useState<string>("unknown");
+
+  // Refs to audio graph
+  const acRef = useRef<AudioContext | null>(null);
+  const srcRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const bufRef = useRef<Float32Array | null>(null);
+  const emaRef = useRef<number | null>(null); // linear domain EMA on RMS
+  const lastPeakRef = useRef<number | null>(null);
+  const lastPeakTsRef = useRef<number>(0);
+  // keep the original MediaStream separately so we can stop tracks reliably
+  const streamRef = useRef<MediaStream | null>(null);
+
+  const historyWindowSec = 15; // seconds of history to show
+  const targetFps = 20; // how often to update UI
+
+  // ---------- helpers ----------
+  const stopInternal = useCallback(() => {
+    // cancel animation frame
+    try {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+      }
+    } catch (e) {
+      // ignore
+    }
+    rafRef.current = null;
+
+    // disconnect/audio nodes
+    try {
+      if (srcRef.current) {
+        try { srcRef.current.disconnect(); } catch {}
+      }
+      if (analyserRef.current) {
+        try { analyserRef.current.disconnect(); } catch {}
+      }
+    } catch {}
+
+    // stop media tracks
+    try {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => {
+          try { t.stop(); } catch {}
+        });
+        streamRef.current = null;
+      }
+    } catch {}
+
+    // close audio context (best-effort)
+    try {
+      const ac = acRef.current;
+      if (ac) {
+        // close() returns a promise, we intentionally don't await here
+        ac.close().catch(() => {});
+      }
+    } catch {}
+
+    acRef.current = null;
+    srcRef.current = null;
+    analyserRef.current = null;
+    bufRef.current = null;
+    emaRef.current = null;
+    lastPeakRef.current = null;
+    lastPeakTsRef.current = 0;
+
+    setRunning(false);
+  }, []);
+
+  // user-facing stop (keeps same name)
+  const stop = useCallback(() => {
+    stopInternal();
+  }, [stopInternal]);
+
+  // permission diagnostic (used from UI)
+  const checkPermissionState = useCallback(async () => {
+    // Try navigator.permissions if available
+    if (!('permissions' in navigator)) {
+      setPermState('unsupported');
+      return 'unsupported';
+    }
+    try {
+      // some TS environments don't include 'microphone' in PermissionName
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore
+      const s = await (navigator as any).permissions.query({ name: 'microphone' });
+      setPermState(s.state ?? 'unknown');
+      return s.state ?? 'unknown';
+    } catch (e) {
+      setPermState('error');
+      return 'error';
+    }
+  }, []);
+
+  const start = useCallback(async () => {
+    if (running) return;
+
+    // Quick secure-context check
+    if (typeof window !== 'undefined' && window.location) {
+      const host = window.location.hostname;
+      const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '';
+      if (window.location.protocol !== 'https:' && !isLocal) {
+        setErr('HTTPS が必要です。localhost 以外では HTTPS で開いてください。');
+        return;
+      }
+    }
+
+    // If permissions API says 'denied', short-circuit with a clearer message
+    try {
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore
+      if (navigator.permissions?.query) {
+        try {
+          // @ts-ignore
+          const p = await (navigator as any).permissions.query({ name: 'microphone' });
+          if (p?.state === 'denied') {
+            setErr('マイク権限がブラウザ設定で拒否されています。サイトの設定でマイクを許可してください。');
+            setPermState('denied');
+            return;
+          }
+        } catch (e) {
+          // ignore permission query errors and proceed to getUserMedia (some browsers don't support it)
+        }
+      }
+
+      setErr("");
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+        video: false,
+      });
+
+      // keep the stream so we can stop tracks later reliably
+      streamRef.current = stream;
+
+      const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
+      // some browsers keep AudioContext suspended until a user gesture — resume it
+      if (ac.state === 'suspended') {
+        try { await ac.resume(); } catch {}
+      }
+
+      const src = ac.createMediaStreamSource(stream);
+      const analyser = ac.createAnalyser();
+      analyser.fftSize = 2048; // time-domain buffer size
+      analyser.smoothingTimeConstant = 0; // we'll do our own smoothing
+
+      acRef.current = ac;
+      srcRef.current = src;
+      analyserRef.current = analyser;
+      src.connect(analyser);
+      bufRef.current = new Float32Array(analyser.fftSize);
+
+      // reset state
+      emaRef.current = null;
+      lastPeakRef.current = null;
+      lastPeakTsRef.current = 0;
+      setPeakDb(null);
+      setDisplayDb(null);
+      setHistory([]);
+
+      // animation loop
+      const loop = () => {
+        try {
+          const analyser = analyserRef.current;
+          const ac = acRef.current;
+          if (!analyser || !ac) return;
+          const buf = bufRef.current;
+          if (!buf) return;
+
+          // guard: if AudioContext is not running, skip processing
+          if (ac.state === 'suspended' || ac.state === 'closed') {
+            rafRef.current = requestAnimationFrame(loop);
+            return;
+          }
+
+          // get samples
+          try {
+            analyser.getFloatTimeDomainData(buf);
+          } catch (e) {
+            // If analyser fails (rare), stop gracefully
+            console.error('analyser.getFloatTimeDomainData failed', e);
+            setErr('音声データの取得に失敗しました。');
+            stopInternal();
+            return;
+          }
+
+          // Compute RMS on the current buffer
+          let sumSq = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const s = buf[i];
+            sumSq += s * s;
+          }
+          const rmsInst = Math.sqrt(sumSq / buf.length);
+
+          // EMA smoothing on linear domain according to smoothingMs
+          const dt = 1000 / targetFps;
+          const alpha = clamp(dt / Math.max(1, smoothingMs), 0.01, 1);
+          const rmsSmoothed = ema(emaRef.current, rmsInst, alpha)!;
+          emaRef.current = rmsSmoothed;
+
+          // Convert to dBFS and apply calibration offset for display (SPL-like)
+          const dBFS = toDbFS(rmsSmoothed); // range approx [-120, 0]
+          const dB = dBFS + calOffset;
+
+          // Peak hold with gentle decay
+          const now = performance.now();
+          const decayPerSec = 6; // dB/s decay when signal drops
+          if (holdPeak) {
+            if (lastPeakRef.current == null || dB > lastPeakRef.current) {
+              lastPeakRef.current = dB;
+              lastPeakTsRef.current = now;
+            } else {
+              const dtSec = (now - lastPeakTsRef.current) / 1000;
+              lastPeakRef.current = lastPeakRef.current - decayPerSec * dtSec;
+              lastPeakTsRef.current = now;
+            }
+            setPeakDb(lastPeakRef.current);
+          } else {
+            setPeakDb(dB);
+          }
+
+          setDisplayDb(dB);
+
+          // Append to history (cap to window)
+          setHistory((h) => {
+            const t = ac.currentTime;
+            const next = [...h, { t, dB }];
+            const minT = t - historyWindowSec;
+            while (next.length && next[0].t < minT) next.shift();
+            return next;
+          });
+
+          rafRef.current = requestAnimationFrame(loop);
+        } catch (e) {
+          console.error('loop error', e);
+          setErr('内部エラーが発生しました。');
+          stopInternal();
+        }
+      };
+
+      rafRef.current = requestAnimationFrame(loop);
+      setRunning(true);
+    } catch (e: any) {
+      console.error(e);
+      // Friendly messages for common getUserMedia errors
+      const name = e?.name ?? '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setErr('マイクの使用が許可されませんでした。ブラウザのサイト設定でマイクを許可してください。');
+      } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+        setErr('マイクが見つかりませんでした。マイクが接続されているか確認してください。');
+      } else if (name === 'NotReadableError') {
+        setErr('マイクにアクセスできません（別アプリで使用中の可能性があります）。');
+      } else {
+        setErr(e?.message ?? String(e));
+      }
+
+      setRunning(false);
+    }
+  }, [calOffset, holdPeak, smoothingMs, running, stopInternal]);
+
+  useEffect(() => {
+    return () => stop(); // cleanup on unmount
+  }, [stop]);
+
+  const levelForBar = useMemo(() => {
+    // Map dBFS+offset to 0..1 for a progress bar visual.
+    // We'll assume a visual range from 20 dB to 100 dB for nicer UX (adjustable via cal slider)
+    const dB = displayDb ?? -Infinity;
+    const min = 20; // lower bar bound (SPL-like)
+    const max = 100; // upper bar bound
+    const norm = (dB - min) / (max - min);
+    return clamp(norm, 0, 1);
+  }, [displayDb]);
+
+  const historyData = useMemo(() => {
+    const t0 = history.length ? history[0].t : 0;
+    return history.map((p) => ({
+      x: Math.max(0, p.t - t0),
+      dB: Number.isFinite(p.dB) ? Number(p.dB.toFixed(1)) : null,
+    }));
+  }, [history]);
+
+  return (
+    <div className="min-h-screen w-full bg-white text-gray-900 p-6">
+      <div className="mx-auto max-w-5xl grid gap-6">
+        <header className="flex items-center justify-between">
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">ブラウザで動く デシベルメーター</h1>
+          <div className="flex items-center gap-2">
+            {!running ? (
+              <Button onClick={start} className="rounded-2xl shadow-lg">
+                <Mic className="mr-2 h-4 w-4" /> マイク開始
+              </Button>
+            ) : (
+              <Button variant="destructive" onClick={stop} className="rounded-2xl shadow-lg">
+                <Square className="mr-2 h-4 w-4" /> 停止
+              </Button>
+            )}
+          </div>
+        </header>
+
+        {err && (
+          <Card className="border-red-300 bg-red-50">
+            <CardContent className="p-4 text-sm text-red-800">
+              <div>マイクが利用できませんでした：{err}</div>
+              <div className="mt-1">・HTTPS で開く（localhost は例外）。</div>
+              <div>・ブラウザの権限設定でマイクを許可してください（Chrome：アドレスバーの鍵アイコン）。</div>
+              <div className="mt-1">・OS のノイズ抑制や自動ゲインはオフにすると精度が安定します。</div>
+            </CardContent>
+          </Card>
+        )}
+
+        <div className="grid md:grid-cols-3 gap-6">
+          <Card className="md:col-span-2">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-lg">現在レベル</CardTitle>
+            </CardHeader>
+            <CardContent className="p-6 pt-0">
+              <div className="flex items-end gap-6">
+                <div className="flex-1">
+                  <div className="text-6xl sm:text-7xl font-extrabold tabular-nums leading-none">
+                    {displayDb == null ? "--.-" : fmt1(displayDb)}
+                    <span className="ml-2 text-xl font-semibold">dB</span>
+                  </div>
+                  <div className="mt-2 text-sm text-gray-500">
+                    * 本アプリの dB は相対値（dBFS に校正オフセットを加算）です。正確な dB SPL 測定にはキャリブレーションが必要です。
+                  </div>
+                </div>
+                <div className="w-40">
+                  <div className="text-xs text-gray-500 mb-1">ピーク</div>
+                  <div className="text-3xl font-bold tabular-nums">
+                    {peakDb == null ? "--.-" : fmt1(peakDb)} <span className="text-sm">dB</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-6">
+                <div className="h-6 w-full rounded-2xl bg-gray-100 overflow-hidden shadow-inner">
+                  <motion.div
+                    className="h-full rounded-2xl"
+                    style={{ background: "linear-gradient(90deg, rgba(59,130,246,1) 0%, rgba(34,197,94,1) 60%, rgba(234,179,8,1) 80%, rgba(239,68,68,1) 100%)" }}
+                    animate={{ width: `${levelForBar * 100}%` }}
+                    transition={{ type: "spring", stiffness: 120, damping: 20 }}
+                  />
+                </div>
+                <div className="flex justify-between text-xs text-gray-500 mt-1">
+                  <span>20 dB</span>
+                  <span>60 dB</span>
+                  <span>80 dB</span>
+                  <span>100 dB</span>
+                </div>
+              </div>
+
+              <div className="mt-8 h-56">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={historyData} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+                    <XAxis dataKey="x" type="number" tickFormatter={(v) => `${(v as number).toFixed(0)}s`} domain={[0, 'dataMax']} />
+                    <YAxis width={40} domain={[0, 110]} tickFormatter={(v) => `${v}`} />
+                    <Tooltip formatter={(v: any) => `${v} dB`} labelFormatter={(l) => `${(l as number).toFixed(1)} s`} />
+                    <ReferenceLine y={85} strokeDasharray="4 4" />
+                    <Line type="monotone" dataKey="dB" dot={false} strokeWidth={2} isAnimationActive={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-lg">設定 / 診断</CardTitle>
+            </CardHeader>
+            <CardContent className="p-6 pt-0 grid gap-5">
+              <div className="grid gap-2">
+                <label className="text-sm text-gray-600">メーター名</label>
+                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Mic #1" />
+              </div>
+
+              <div className="grid gap-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-gray-600">キャリブレーション（dB を加算）</label>
+                  <span className="text-sm font-semibold tabular-nums">{calOffset >= 0 ? "+" : ""}{calOffset} dB</span>
+                </div>
+                <Slider value={[calOffset]} min={-50} max={+50} step={1} onValueChange={(v) => setCalOffset(v[0])} />
+                <p className="text-xs text-gray-500 leading-relaxed">
+                  既知の音（例：校正器 94 dB @1kHz）を鳴らし、表示が一致するよう調整してください。一般のマイク・端末では絶対値は保証されません。
+                </p>
+              </div>
+
+              <div className="grid gap-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-gray-600">スムージング（ms）</label>
+                  <span className="text-sm font-semibold tabular-nums">{smoothingMs} ms</span>
+                </div>
+                <Slider value={[smoothingMs]} min={0} max={1000} step={50} onValueChange={(v) => setSmoothingMs(v[0])} />
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Activity className="h-4 w-4" />
+                  <span className="text-sm">ピークホールド</span>
+                </div>
+                <Switch checked={holdPeak} onCheckedChange={setHoldPeak} />
+              </div>
+
+              <div className="grid gap-2 pt-2">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm text-gray-600">権限チェック（診断）</div>
+                  <div className="flex items-center gap-2">
+                    <Button size="sm" onClick={() => checkPermissionState()}>権限チェック</Button>
+                    <span className="text-xs text-gray-500 tabular-nums">状態: {permState}</span>
+                  </div>
+                </div>
+                <div className="text-xs text-gray-500">
+                  許可に問題がある場合は、ブラウザのサイト設定（アドレスバーの鍵アイコン）でマイクを許可してください。HTTPS が必要です（localhost は例外）。
+                </div>
+              </div>
+
+              <div className="text-xs text-gray-500">
+                <p>⚠️ ブラウザと一般的なマイクでは A 特性（dBA）や騒音計のクラス精度は満たしません。目安としてご利用ください。</p>
+                <p className="mt-1">最良の結果のため：ヘッドセットではなく端末内蔵マイク／静かな部屋／スピーカーの近くでの測定を避ける。</p>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        <footer className="text-xs text-gray-400 mt-4">
+          <p>音声処理: Web Audio API（rms→dBFS→オフセット）。グラフ: Recharts。UI: shadcn/ui + Tailwind。</p>
+        </footer>
+      </div>
+    </div>
+  );
+}
